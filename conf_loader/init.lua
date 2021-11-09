@@ -27,8 +27,7 @@ ffi.cdef([[
 local cipher_suites = {
                    modern = {
                 protocols = "TLSv1.3",
-                  ciphers = nil,   -- all TLSv1.3 ciphers are consider
-ed safe
+                  ciphers = nil,   -- all TLSv1.3 ciphers are considered safe
     prefer_server_ciphers = "off", -- as all are safe, let client choose
   },
              intermediate = {
@@ -97,9 +96,75 @@ local HEADER_KEY_TO_NAME = {
 local EMPTY = {}
 
 local DYNAMIC_KEY_NAMESPACES = {
+  {
+    injected_conf_name = "nginx_main_directives",
+    prefix = "nginx_main_",
+    ignore = EMPTY,
+  },
+  {
+    injected_conf_name = "nginx_events_directives",
+    prefix = "nginx_events_",
+    ignore = EMPTY,
+  },
+  {
+    injected_conf_name = "nginx_http_directives",
+    prefix = "nginx_http_",
+    ignore = {
+      upstream_keepalive          = true,
+      upstream_keepalive_timeout  = true,
+      upstream_keepalive_requests = true,
+    },
+  },
+  {
+    injected_conf_name = "nginx_upstream_directives",
+    prefix = "nginx_upstream_",
+    ignore = EMPTY,
+  },
+  {
+    injected_conf_name = "nginx_proxy_directives",
+    prefix = "nginx_proxy_",
+    ignore = EMPTY,
+  },
+  {
+    injected_conf_name = "nginx_status_directives",
+    prefix = "nginx_status_",
+    ignore = EMPTY,
+  },
+  {
+    injected_conf_name = "nginx_admin_directives",
+    prefix = "nginx_admin_",
+    ignore = EMPTY,
+  },
+  {
+    injected_conf_name = "nginx_stream_directives",
+    prefix = "nginx_stream_",
+    ignore = EMPTY,
+  },
+  {
+    injected_conf_name = "nginx_supstream_directives",
+    prefix = "nginx_supstream_",
+    ignore = EMPTY,
+  },
+  {
+    injected_conf_name = "nginx_sproxy_directives",
+    prefix = "nginx_sproxy_",
+    ignore = EMPTY,
+  },
+  {
+    prefix = "pluginserver_",
+    ignore = EMPTY,
+  },
 }
 
 local DEPRECATED_DYNAMIC_KEY_NAMESPACES = {
+  {
+    injected_conf_name = "nginx_upstream_directives",
+    previous_conf_name = "nginx_http_upstream_directives",
+  },
+  {
+    injected_conf_name = "nginx_status_directives",
+    previous_conf_name = "nginx_http_status_directives",
+  },
 }
 
 local PREFIX_PATHS = {
@@ -134,9 +199,71 @@ local PREFIX_PATHS = {
 }
 
 local function is_predefined_dhgroup(group)
+  if type(group) ~= "string" then
+    return false
+  end
+
+  return not not openssl_pkey.paramgen({
+    type = "DH",
+    group = group,
+  })
 end
 
 local function upstream_keepalive_deprecated_properties(conf)
+  if conf.nginx_upstream_keepalive == nil then
+    if conf.nginx_http_upstream_keepalive ~= nil then
+      conf.nginx_upstream_keepalive = conf.nginx_http_upstream_keepalive
+    end
+  end
+
+  if conf.nginx_upstream_keepalive == nil then
+    if conf.upstream_keepalive ~= nil then
+      if conf.upstream_keepalive == 0 then
+        conf.nginx_upstream_keepalive = "NONE"
+        conf.nginx_http_upstream_keepalive = "NONE"
+      else
+        conf.nginx_upstream_keepalive = tostring(conf.upstream_keepalive)
+        conf.nginx_http_upstream_keepalive = tostring(conf.upstream_keepalive)
+      end
+    end
+  end
+
+  -- nginx_upstream_keepalive -> upstream_keepalive_pool_size
+  if conf.upstream_keepalive_pool_size == nil then
+    if conf.nginx_upstream_keepalive ~= nil then
+      if conf.nginx_upstream_keepalive == "NONE" then
+        conf.upstream_keepalive_pool_size = 0
+
+      else
+        conf.upstream_keepalive_pool_size = tonumber(conf.nginx_upstream_keepalive)
+      end
+    end
+  end
+
+  -- nginx_http_upstream_keepalive_requests -> nginx_upstream_keepalive_requests
+  if conf.nginx_upstream_keepalive_requests == nil then
+    conf.nginx_upstream_keepalive_requests = conf.nginx_http_upstream_keepalive_requests
+  end
+
+  -- nginx_upstream_keepalive_requests -> upstream_keepalive_max_requests
+  if conf.upstream_keepalive_max_requests == nil
+     and conf.nginx_upstream_keepalive_requests ~= nil
+  then
+    conf.upstream_keepalive_max_requests = tonumber(conf.nginx_upstream_keepalive_requests)
+  end
+
+  -- nginx_http_upstream_keepalive_timeout -> nginx_upstream_keepalive_timeout
+  if conf.nginx_upstream_keepalive_timeout == nil then
+    conf.nginx_upstream_keepalive_timeout = conf.nginx_http_upstream_keepalive_timeout
+  end
+
+  -- nginx_upstream_keepalive_timeout -> upstream_keepalive_idle_timeout
+  if conf.upstream_keepalive_idle_timeout == nil
+     and conf.nginx_upstream_keepalive_timeout ~= nil
+  then
+    conf.upstream_keepalive_idle_timeout =
+      utils.nginx_conf_time_to_seconds(conf.nginx_upstream_keepalive_timeout)
+  end
 end
 
 local CONF_INFERENCES = {
@@ -507,21 +634,446 @@ local _nop_tostring_mt = {
 }
 
 local function check_and_infer(conf, opts)
+  local errors = {}
+
+  for k, value in pairs(conf) do
+    local v_schema = CONF_INFERENCES[k] or {}
+    local typ = v_schema.typ
+
+    if type(value) == "string" then
+      if not opts.from_kong_env then
+        value = string.gsub(value, "[^\\]#.-$", "")
+        value = string.gsub(value, "\\#", "#")
+      end
+
+      value = pl_stringx.strip(value)
+    end
+
+    if typ == "boolean" then
+      value = value == true or value == "on" or value == "true"
+
+    elseif typ == "ngx_boolean" then
+      value = (value == "on" or value == true) and "on" or "off"
+
+    elseif typ == "string" then
+      value = tostring(value)
+
+    elseif typ == "number" then
+      value = tonumber(value)
+
+    elseif typ == "array" and type(value) == "string" then
+      value = setmetatable(pl_stringx.split(value, ","), nil)
+
+      for i = 1, #value do
+        value[i] = pl_stringx.strip(value[i])
+      end
+    end
+
+    if value == "" then
+      value = nil
+    end
+
+    typ = typ or "string"
+
+    if value and not typ_checks[typ](value) then
+      errors[#errors + 1] = fmt("%s is not a %s: '%s'", k, typ,
+                                tostring(value))
+
+    elseif v_schema.enum and not tablex.find(v_schema.enum, value) then
+      errors[#errors + 1] = fmt("%s has an invalid value: '%s' (%s)", k,
+                              tostring(value), concat(v_schema.enum, ", "))
+
+    end
+
+    conf[k] = value
+  end
+
+  -- custom validations
+
+  conf.host_ports = {}
+  if conf.port_maps then
+    local MIN_PORT = 1
+    local MAX_PORT = 65535
+
+    for _, port_map in ipairs(conf.port_maps) do
+      local colpos = string.find(port_map, ":", nil, true)
+      if not colpos then
+        errors[#errors + 1] = "invalid port mapping (`port_maps`): " .. port_map
+      else
+        local host_port_str = string.sub(port_map, 1, colpos - 1)
+        local host_port_num = tonumber(host_port_str, 10)
+        local kong_port_str = string.sub(port_map, colpos + 1)
+        local kong_port_num = tonumber(kong_port_str, 10)
+
+        if  (host_port_num and host_port_num >= MIN_PORT and host_port_num <= MAX_PORT)
+        and (kong_port_num and kong_port_num >= MIN_PORT and kong_port_num <= MAX_PORT)
+        then
+            conf.host_ports[kong_port_num] = host_port_num
+            conf.host_ports[kong_port_str] = host_port_num
+        else
+          errors[#errors + 1] = "invalid port mapping (`port_maps`): " .. port_map
+        end
+      end
+    end
+  end
+
+  if conf.database == "cassandra" then
+    error("cassandra")
+  end
+
+  for _, prefix in ipairs({ "proxy_", "admin_", "status_" }) do
+    local listen = conf[prefix .. "listen"]
+
+    local ssl_enabled = (concat(listen, ",") .. " "):find("%sssl[%s,]") ~= nil
+    if not ssl_enabled and prefix == "proxy_" then
+      ssl_enabled = (concat(conf.stream_listen, ",") .. " "):find("%sssl[%s,]") ~= nil
+    end
+
+    if prefix == "proxy_" then
+      prefix = ""
+    end
+
+    if ssl_enabled then
+      conf.ssl_enabled = true
+
+      local ssl_cert = conf[prefix .. "ssl_cert"]
+      local ssl_cert_key = conf[prefix .. "ssl_cert_key"]
+
+      if #ssl_cert > 0 and #ssl_cert_key == 0 then
+        errors[#errors + 1] = prefix .. "ssl_cert_key must be specified"
+
+      elseif #ssl_cert_key > 0 and #ssl_cert == 0 then
+        errors[#errors + 1] = prefix .. "ssl_cert must be specified"
+
+      elseif #ssl_cert ~= #ssl_cert_key then
+        errors[#errors + 1] = prefix .. "ssl_cert was specified " .. #ssl_cert .. " times while " ..
+          prefix .. "ssl_cert_key was specified " .. #ssl_cert_key .. " times"
+      end
+
+      if ssl_cert then
+        for _, cert in ipairs(ssl_cert) do
+          if not pl_path.exists(cert) then
+            errors[#errors + 1] = prefix .. "ssl_cert: no such file at " .. cert
+          end
+        end
+      end
+
+      if ssl_cert_key then
+        for _, cert_key in ipairs(ssl_cert_key) do
+          if not pl_path.exists(cert_key) then
+            errors[#errors + 1] = prefix .. "ssl_cert_key: no such file at " .. cert_key
+          end
+        end
+      end
+    end
+  end
+
+  if conf.client_ssl then
+    if conf.client_ssl_cert and not conf.client_ssl_cert_key then
+      errors[#errors + 1] = "client_ssl_cert_key must be specified"
+
+    elseif conf.client_ssl_cert_key and not conf.client_ssl_cert then
+      errors[#errors + 1] = "client_ssl_cert must be specified"
+    end
+
+    if conf.client_ssl_cert and not pl_path.exists(conf.client_ssl_cert) then
+      errors[#errors + 1] = "client_ssl_cert: no such file at " ..
+                          conf.client_ssl_cert
+    end
+
+    if conf.client_ssl_cert_key and not pl_path.exists(conf.client_ssl_cert_key) then
+      errors[#errors + 1] = "client_ssl_cert_key: no such file at " ..
+                          conf.client_ssl_cert_key
+    end
+  end
+
+  if conf.lua_ssl_trusted_certificate then
+    local new_paths = {}
+
+    for i, path in ipairs(conf.lua_ssl_trusted_certificate) do
+      error("lua_ssl_trusted_certificate")
+    end
+
+    conf.lua_ssl_trusted_certificate = new_paths
+  end
+
+  if conf.ssl_cipher_suite ~= "custom" then
+    local suite = cipher_suites[conf.ssl_cipher_suite]
+    if suite then
+      conf.ssl_ciphers = suite.ciphers
+      conf.nginx_http_ssl_protocols = suite.protocols
+      conf.nginx_http_ssl_prefer_server_ciphers = suite.prefer_server_ciphers
+      conf.nginx_stream_ssl_protocols = suite.protocols
+      conf.nginx_stream_ssl_prefer_server_ciphers = suite.prefer_server_ciphers
+
+      if conf.ssl_cipher_suite ~= "old" then
+        conf.ssl_dhparam = suite.dhparams
+        conf.nginx_http_ssl_dhparam = suite.dhparams
+        conf.nginx_stream_ssl_dhparam = suite.dhparams
+      end
+
+    else
+      errors[#errors + 1] = "Undefined cipher suite " .. tostring(conf.ssl_cipher_suite)
+    end
+  end
+
+  if conf.ssl_dhparam then
+    if not is_predefined_dhgroup(conf.ssl_dhparam) and not pl_path.exists(conf.ssl_dhparam) then
+      errors[#errors + 1] = "ssl_dhparam: no such file at " .. conf.ssl_dhparam
+    end
+  else
+    for _, key in ipairs({ "nginx_http_ssl_dhparam", "nginx_stream_ssl_dhparam" }) do
+      local file = conf[key]
+      if file and not is_predefined_dhgroup(file) and not pl_path.exists(file) then
+        errors[#errors + 1] = key .. ": no such file at " .. file
+      end
+    end
+  end
+
+  if conf.headers then
+    for _, token in ipairs(conf.headers) do
+      if token ~= "off" and not HEADER_KEY_TO_NAME[string.lower(token)] then
+        errors[#errors + 1] = fmt("headers: invalid entry '%s'",
+                                  tostring(token))
+      end
+    end
+  end
+
+  if conf.dns_resolver then
+    for _, server in ipairs(conf.dns_resolver) do
+      local dns = utils.normalize_ip(server)
+
+      if not dns or dns.type == "name" then
+        errors[#errors + 1] = "dns_resolver must be a comma separated list " ..
+                              "in the form of IPv4/6 or IPv4/6:port, got '"  ..
+                              server .. "'"
+      end
+    end
+  end
+
+  if conf.dns_hostsfile then
+    if not pl_path.isfile(conf.dns_hostsfile) then
+      errors[#errors + 1] = "dns_hostsfile: file does not exist"
+    end
+  end
+
+  if conf.dns_order then
+    local allowed = { LAST = true, A = true, CNAME = true, SRV = true }
+
+    for _, name in ipairs(conf.dns_order) do
+      if not allowed[name:upper()] then
+        errors[#errors + 1] = fmt("dns_order: invalid entry '%s'",
+                                  tostring(name))
+      end
+    end
+  end
+
+  if not conf.lua_package_cpath then
+    conf.lua_package_cpath = ""
+  end
+
+  for _, address in ipairs(conf.trusted_ips) do
+    if not utils.is_valid_ip_or_cidr(address) and address ~= "unix:" then
+      errors[#errors + 1] = "trusted_ips must be a comma separated list in " ..
+                            "the form of IPv4 or IPv6 address or CIDR "      ..
+                            "block or 'unix:', got '" .. address .. "'"
+    end
+  end
+
+  if conf.pg_max_concurrent_queries < 0 then
+    errors[#errors + 1] = "pg_max_concurrent_queries must be greater than 0"
+  end
+
+  if conf.pg_max_concurrent_queries ~= math.floor(conf.pg_max_concurrent_queries) then
+    errors[#errors + 1] = "pg_max_concurrent_queries must be an integer greater than 0"
+  end
+
+  if conf.pg_semaphore_timeout < 0 then
+    errors[#errors + 1] = "pg_semaphore_timeout must be greater than 0"
+  end
+
+  if conf.pg_semaphore_timeout ~= math.floor(conf.pg_semaphore_timeout) then
+    errors[#errors + 1] = "pg_semaphore_timeout must be an integer greater than 0"
+  end
+
+  if conf.pg_ro_max_concurrent_queries then
+    if conf.pg_ro_max_concurrent_queries < 0 then
+      errors[#errors + 1] = "pg_ro_max_concurrent_queries must be greater than 0"
+    end
+
+    if conf.pg_ro_max_concurrent_queries ~= math.floor(conf.pg_ro_max_concurrent_queries) then
+      errors[#errors + 1] = "pg_ro_max_concurrent_queries must be an integer greater than 0"
+    end
+  end
+
+  if conf.pg_ro_semaphore_timeout then
+    if conf.pg_ro_semaphore_timeout < 0 then
+      errors[#errors + 1] = "pg_ro_semaphore_timeout must be greater than 0"
+    end
+
+    if conf.pg_ro_semaphore_timeout ~= math.floor(conf.pg_ro_semaphore_timeout) then
+      errors[#errors + 1] = "pg_ro_semaphore_timeout must be an integer greater than 0"
+    end
+  end
+
+  if conf.worker_state_update_frequency <= 0 then
+    errors[#errors + 1] = "worker_state_update_frequency must be greater than 0"
+  end
+
+  if conf.role == "control_plane" then
+    error("control_plane")
+  elseif conf.role == "data_plane" then
+    error("data_plane")
+  end
+
+  if conf.cluster_data_plane_purge_delay < 60 then
+    errors[#errors + 1] = "cluster_data_plane_purge_delay must be 60 or greater"
+  end
+
+  if conf.role == "control_plane" or conf.role == "data_plane" then
+    error("control_plane or data_plane")
+  end
+
+  if conf.upstream_keepalive_pool_size < 0 then
+    errors[#errors + 1] = "upstream_keepalive_pool_size must be 0 or greater"
+  end
+
+  if conf.upstream_keepalive_max_requests < 0 then
+    errors[#errors + 1] = "upstream_keepalive_max_requests must be 0 or greater"
+  end
+
+  if conf.upstream_keepalive_idle_timeout < 0 then
+    errors[#errors + 1] = "upstream_keepalive_idle_timeout must be 0 or greater"
+  end
+
+  return #errors == 0, errors[1], errors
 end
 
 local function overrides(k, default_v, opts, file_conf, arg_conf)
+  opts = opts or {}
+
+  local value
+  local escape
+
+  if file_conf and file_conf[k] == nil and not opts.no_defaults then
+    value = default_v == "NONE" and "" or default_v
+  else
+    value = file_conf[k]
+  end
+
+  -- 如果defaults_only为true就不再找其他可能的值了
+  if opts.defaults_only then
+    return value, k
+  end
+
+  if not opts.from_kong_env then
+    local env_name = "KONG_" .. string.upper(k)
+    local env = os.getenv(env_name)
+    if env ~= nil then
+      local to_print = env
+
+      if CONF_SENSITIVE[k] then
+        to_print = CONF_SENSITIVE_PLACEHOLDER
+      end
+
+      log.debug('%s ENV found with "%s"', env_name, to_print)
+
+      value = env
+      escape = true
+    end
+  end
+
+  if arg_conf and arg_conf[k] ~= nil then
+    value = arg_conf[k]
+    escape = true
+  end
+
+  -- escape是为了过滤#
+  if escape and type(value) == "string" then
+    repeat
+      local s, n = string.gsub(value, [[([^\])#]], [[%1\#]])
+      value = s
+    until n == 0
+  end
+
+  return value, k
 end
 
 local function parse_nginx_directives(dyn_namespace, conf, injected_in_namespace)
+  conf = conf or {}
+  local directives = {}
+
+  for k, v in pairs(conf) do
+    if type(k) == "string" and not injected_in_namespace[k] then
+      local directive = string.match(k, dyn_namespace.prefix .. "(.+)")
+      if directive then
+        if v ~= "NONE" and not dyn_namespace.ignore[directive] then
+          table.insert(directives, { name = directive, value = v })
+        end
+        injected_in_namespace[k] = true
+      end
+    end
+  end
+
+  return directives
 end
 
 local function aliased_properties(conf)
+  for property_name, v_schema in pairs(CONF_INFERENCES) do
+    local alias = v_schema.alias
+
+    if alias and conf[property_name] ~= nil and conf[alias.replacement] == nil then
+      if alias.alias then
+        conf[alias.replacement] = alias.alias(conf)
+      else
+        local value = conf[property_name]
+        if type(value) == "boolean" then
+          value = value and "on" or "off"
+        end
+        conf[alias.replacement] = tostring(value)
+      end
+    end
+  end
 end
 
 local function deprecated_properties(conf, opts)
+  for property_name, v_schema in pairs(CONF_INFERENCES) do
+    local deprecated = v_schema.deprecated
+    if deprecated and conf[property_name] ~= nil then
+      if not opts.from_kong_env then
+        if deprecated.replacement then
+          log.warn("the '%s' configuration property is deprecated, use " ..
+                     "'%s' instead", property_name, deprecated.replacement)
+        else
+          log.warn("the '%s' configuration property is deprecated",
+                   property_name)
+        end
+      end
+
+      if deprecated.alias then
+        deprecated.alias(conf)
+      end
+    end
+  end
 end
 
 local function dynamic_properties(conf)
+  for property_name, v_schema in pairs(CONF_INFERENCES) do
+    local value = conf[property_name]
+    if value ~= nil then
+      local directives = v_schema.directives
+      if directives then
+        for _, directive in ipairs(directives) do
+          if not conf[directive] then
+            if type(value) == "boolean" then
+              value = value and "on" or "off"
+            end
+            conf[directive] = value
+          end
+        end
+      end
+    end
+  end
 end
 
 local function load_config_file(path)
@@ -594,11 +1146,50 @@ local function load(path, custom_conf, opts)
     local function add_dynamic_keys(t)
       t = t or {}
 
+--ssl_protocols = {
+--  typ = "string",
+--  directives = {
+--    "nginx_http_ssl_protocols",
+--    "nginx_stream_ssl_protocols",
+--  },
+--},
       for property_name, v_schema in pairs(CONF_INFERENCES) do
+        local directives = v_schema.directives
+        if directives then
+          local v = t[property_name]
+          if v then
+            if type(v) == "boolean" then
+              v = v and "on" or "off"
+            end
+
+            tostring(v)
+
+            for _, directive in ipairs(directives) do
+              dynamic_keys[directive] = true
+              -- 以指令作为键，值为对应配置的值，放到conf里
+              t[directive] = v
+            end
+          end
+        end
       end
     end
 
+    -- 将指令配置放到dynamic_keys中，值变成字符串
     local function find_dynamic_keys(dyn_prefix, t)
+      t = t or {}
+
+      for k, v in pairs(t) do
+        local directive = string.match(k, "^(" .. dyn_prefix .. ".+)")
+        if directive then
+          dynamic_keys[directive] = true
+
+          if type(v) == "boolean" then
+            v = v and "on" or "off"
+          end
+
+          t[k] = tostring(v)
+        end
+      end
     end
 
     local kong_env_vars = {}
@@ -621,7 +1212,270 @@ local function load(path, custom_conf, opts)
     add_dynamic_keys(custom_conf)
     add_dynamic_keys(kong_env_vars)
     add_dynamic_keys(from_file_conf)
+
+--{
+--  injected_conf_name = "nginx_admin_directives",
+--  prefix = "nginx_admin_",
+--  ignore = EMPTY,
+--},
+    for _, dyn_namespace in ipairs(DYNAMIC_KEY_NAMESPACES) do
+      find_dynamic_keys(dyn_namespace.prefix, defaults)
+      find_dynamic_keys(dyn_namespace.prefix, custom_conf)
+      find_dynamic_keys(dyn_namespace.prefix, kong_env_vars)
+      find_dynamic_keys(dyn_namespace.prefix, from_file_conf)
+    end
+    
+    --local a = {a = true, b = true}
+    --local b = {a = "on"}
+    --local c = tablex.merge(a, b, true)
+    -- {a = true, b = true} MERGE {a = "on"} => {a:"on",b:true}
+    defaults = tablex.merge(dynamic_keys, defaults, true)
   end
+
+    local a = {a = true, b = true}
+    local b = {a = "on"}
+    local c = tablex.merge(a, b, true)
+  
+  local user_conf = tablex.pairmap(overrides, defaults,
+                      tablex.union(opts, { no_defaults = true, }),
+                      from_file_conf, custom_conf)
+  if not opts.starting then
+    log.disable()
+  end
+
+  aliased_properties(user_conf)
+  dynamic_properties(user_conf)
+  deprecated_properties(user_conf, opts)
+
+  -- merge user_conf with defaults
+  local conf = tablex.pairmap(overrides, defaults,
+                              tablex.union(opts, { defaults_only = true, }),
+                              user_conf)
+
+  -- validation
+  -- 检查配置有效性
+  local ok, err, errors = check_and_infer(conf, opts)
+
+  if not opts.starting then
+    log.enable()
+  end
+
+  if not ok then
+    return nil, err, errors
+  end
+
+  conf = tablex.merge(conf, defaults)
+
+  local default_nginx_main_user = false
+  local default_nginx_user = false
+
+  do
+    local user = utils.strip(conf.nginx_main_user):gsub("%s+", " ")
+    if user == "nobody" or user == "nobody nobody" then
+      conf.nginx_main_user = nil
+
+    elseif user == "kong" or user == "kong kong" then
+      default_nginx_main_user = true
+    end
+
+    local user = utils.strip(conf.nginx_user):gsub("%s+", " ")
+    if user == "nobody" or user == "nobody nobody" then
+      conf.nginx_user = nil
+
+    elseif user == "kong" or user == "kong kong" then
+      default_nginx_user = true
+    end
+  end
+
+  if C.getpwnam("kong") == nil or C.getgrnam("kong") == nil then
+    if default_nginx_main_user == true and default_nginx_user == true then
+      conf.nginx_user = nil
+      conf.nginx_main_user = nil
+    end
+  end
+
+  do
+    local injected_in_namespace = {}
+
+    for _, dyn_namespace in ipairs(DYNAMIC_KEY_NAMESPACES) do
+      if dyn_namespace.injected_conf_name then
+        injected_in_namespace[dyn_namespace.injected_conf_name] = true
+        local directives = parse_nginx_directives(dyn_namespace, conf, injected_in_namespace)
+        conf[dyn_namespace.injected_conf_name] = setmetatable(directives, _nop_tostring_mt)
+      end
+    end
+
+    for _, dyn_namespace in ipairs(DEPRECATED_DYNAMIC_KEY_NAMESPACES) do
+      if conf[dyn_namespace.injected_conf_name] then
+        conf[dyn_namespace.previous_conf_name] = conf[dyn_namespace.injected_conf_name]
+      end
+    end
+  end
+
+  do
+    local conf_arr = {}
+
+    for k, v in pairs(conf) do
+      local to_print = v
+      if CONF_SENSITIVE[k] then
+        to_print = "******"
+      end
+
+      conf_arr[#conf_arr+1] = k .. " = " .. pl_pretty.write(to_print, "")
+    end
+
+    table.sort(conf_arr)
+
+    for i = 1, #conf_arr do
+      log.debug(conf_arr[i])
+    end
+  end
+
+  do
+    local plugins = {}
+    if #conf.plugins > 0 and conf.plugins[1] ~= "off" then
+      for i = 1, #conf.plugins do
+        local plugin_name = pl_stringx.strip(conf.plugins[i])
+
+        if plugin_name ~= "off" then
+          if plugin_name == "bundled" then
+            plugins = tablex.merge(constants.BUNDLED_PLUGINS, plugins, true)
+          else
+            plugins[plugin_name] = true
+          end
+        end
+      end
+    end
+    conf.loaded_plugins = setmetatable(plugins, _nop_tostring_mt)
+  end
+
+  if conf.loaded_plugins["prometheus"] then
+    error("prometheus")
+  end
+
+  for _, dyn_namespace in ipairs(DYNAMIC_KEY_NAMESPACES) do
+    if dyn_namespace.injected_conf_name then
+      table.sort(conf[dyn_namespace.injected_conf_name], function(a, b)
+        return a.name < b.name
+      end)
+    end
+  end
+
+  ok, err = listeners.parse(conf, {
+    { name = "proxy_listen",   subsystem = "http",   ssl_flag = "proxy_ssl_enabled" },
+    { name = "stream_listen",  subsystem = "stream", ssl_flag = "stream_proxy_ssl_enabled" },
+    { name = "admin_listen",   subsystem = "http",   ssl_flag = "admin_ssl_enabled" },
+    { name = "status_listen",  flags = { "ssl" },    ssl_flag = "status_ssl_enabled" },
+    { name = "cluster_listen", subsystem = "http" },
+  })
+  if not ok then
+    return nil, err
+  end
+
+  do
+    local enabled_headers = {}
+
+    for _, v in pairs(HEADER_KEY_TO_NAME) do
+      enabled_headers[v] = false
+    end
+
+    if #conf.headers > 0 and conf.headers[1] ~= "off" then
+      for _, token in ipairs(conf.headers) do
+        if token ~= "off" then
+          enabled_headers[HEADER_KEY_TO_NAME[string.lower(token)]] = true
+        end
+      end
+    end
+
+    if enabled_headers.server_tokens then
+      enabled_headers[HEADERS.VIA] = true
+      enabled_headers[HEADERS.SERVER] = true
+    end
+
+    if enabled_headers.latency_tokens then
+      enabled_headers[HEADERS.PROXY_LATENCY] = true
+      enabled_headers[HEADERS.RESPONSE_LATENCY] = true
+      enabled_headers[HEADERS.ADMIN_LATENCY] = true
+      enabled_headers[HEADERS.UPSTREAM_LATENCY] = true
+    end
+
+    conf.enabled_headers = setmetatable(enabled_headers, _nop_tostring_mt)
+  end
+
+  conf.prefix = pl_path.abspath(conf.prefix)
+
+  for _, prefix in ipairs({ "ssl", "admin_ssl", "status_ssl", "client_ssl", "cluster" }) do
+    local ssl_cert = conf[prefix .. "_cert"]
+    local ssl_cert_key = conf[prefix .. "_cert_key"]
+
+    if ssl_cert and ssl_cert_key then
+      if type(ssl_cert) == "table" then
+        for i, cert in ipairs(ssl_cert) do
+          ssl_cert[i] = pl_path.abspath(cert)
+        end
+
+      else
+        conf[prefix .. "_cert"] = pl_path.abspath(ssl_cert)
+      end
+
+      if type(ssl_cert) == "table" then
+        for i, key in ipairs(ssl_cert_key) do
+          ssl_cert_key[i] = pl_path.abspath(key)
+        end
+
+      else
+        conf[prefix .. "_cert_key"] = pl_path.abspath(ssl_cert_key)
+      end
+    end
+  end
+
+  if conf.cluster_ca_cert then
+    conf.cluster_ca_cert = pl_path.abspath(conf.cluster_ca_cert)
+  end
+
+  local ssl_enabled = conf.proxy_ssl_enabled or
+                      conf.stream_proxy_ssl_enabled or
+                      conf.admin_ssl_enabled or
+                      conf.status_ssl_enabled
+
+  for _, name in ipairs({ "nginx_http_directives", "nginx_stream_directives" }) do
+    for i, directive in ipairs(conf[name]) do
+      if directive.name == "ssl_dhparam" then
+        if is_predefined_dhgroup(directive.value) then
+          if ssl_enabled then
+            directive.value = pl_path.abspath(pl_path.join(conf.prefix, "ssl", directive.value .. ".pem"))
+
+          else
+            table.remove(conf[name], i)
+          end
+
+        else
+          directive.value = pl_path.abspath(directive.value)
+        end
+
+        break
+      end
+    end
+  end
+
+  if conf.lua_ssl_trusted_certificate
+     and #conf.lua_ssl_trusted_certificate > 0 then
+    conf.lua_ssl_trusted_certificate =
+      tablex.map(pl_path.abspath, conf.lua_ssl_trusted_certificate)
+
+    conf.lua_ssl_trusted_certificate_combined =
+      pl_path.abspath(pl_path.join(conf.prefix, ".ca_combined"))
+  end
+
+  for property, t_path in pairs(PREFIX_PATHS) do
+    conf[property] = pl_path.join(conf.prefix, unpack(t_path))
+  end
+
+  log.verbose("prefix in use: %s", conf.prefix)
+
+  assert(require("kong.tools.dns")(conf))
+
+  return setmetatable(conf, nil)
 end
 
 return setmetatable({
