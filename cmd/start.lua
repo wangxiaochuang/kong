@@ -1,4 +1,6 @@
+local migrations_utils = require "kong.cmd.utils.migrations"
 local prefix_handler = require "kong.cmd.utils.prefix_handler"
+local nginx_signals = require "kong.cmd.utils.nginx_signals"
 local conf_loader = require "kong.conf_loader"
 local kong_global = require "kong.global"
 local kill = require "kong.cmd.utils.kill"
@@ -26,7 +28,34 @@ local function execute(args)
   kong_global.init_pdk(_G.kong, conf, nil)
 
   local db = assert(DB.new(conf))
+  assert(db:init_connector())
 
+  local schema_state = assert(db:schema_state())
+  local err
+
+  xpcall(function()
+    if not schema_state:is_up_to_date() and args.run_migrations then
+      error("schema_state:is_up_to_date")
+    end
+
+    migrations_utils.check_state(schema_state)
+
+    if schema_state.missing_migrations or schema_state.pending_migrations then
+      error("schema_state.missing_migrations")
+    end
+
+    assert(nginx_signals.start(conf))
+
+    log("Kong started")
+  end, function(e)
+    err = e
+  end)
+  if err then
+    log.verbose("could not start Kong, stopping services")
+    pcall(nginx_signals.stop(conf))
+    log.verbose("stopped services")
+    error(err)
+  end
 end
 
 local lapp = [[

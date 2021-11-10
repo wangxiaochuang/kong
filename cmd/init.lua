@@ -11,6 +11,8 @@ local options = [[
 local cmds_arr = {}
 local cmds = {
   start = true,
+  stop = true,
+  restart = true
 }
 
 for k in pairs(cmds) do

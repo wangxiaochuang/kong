@@ -1,8 +1,8 @@
 local meta = require "kong.meta"
 local PDK = require "kong.pdk"
 local phase_checker = require "kong.pdk.private.phases"
---local kong_cache = require "kong.cache"
---local kong_cluster_events = require "kong.cluster_events"
+local kong_cache = require "kong.cache"
+local kong_cluster_events = require "kong.cluster_events"
 local kong_constants = require "kong.constants"
 
 local type = type
@@ -46,7 +46,16 @@ function _GLOBAL.del_named_ctx(self, name)
 end
 
 function _GLOBAL.set_phase(self, phase)
-  error("in set_phase")
+  if not self then
+    error("arg #1 cannot be nil", 2)
+  end
+
+  local kctx = self.ctx
+  if not kctx then
+    error("ctx PDK module not initialized", 2)
+  end
+
+  kctx.core.phase = phase
 end
 
 function _GLOBAL.get_phase(self)
@@ -82,19 +91,81 @@ function _GLOBAL.init_pdk(self, kong_config, pdk_major_version)
 end
 
 function _GLOBAL.init_worker_events()
-  error("in init_worker_events")
+  local worker_events = require "resty.worker.events"
+
+  local ok, err = worker_events.configure {
+    shm = "kong_process_events",
+    timeout = 5,
+    interval = 1,
+
+    wait_interval = 0.010,
+    wait_max = 0.5,
+  }
+  if not ok then
+    return nil, err
+  end
+
+  return worker_events
 end
 
 function _GLOBAL.init_cluster_events(kong_config, db)
-  error("in init_cluster_events")
+  return kong_cluster_events.new({
+    db            = db,
+    poll_interval = kong_config.db_update_frequency,
+    poll_offset   = kong_config.db_update_propagation,
+    poll_delay    = kong_config.db_update_propagation,
+  })
 end
 
 function _GLOBAL.init_cache(kong_config, cluster_events, worker_events)
-  error("in init_cache")
+  local db_cache_ttl = kong_config.db_cache_ttl
+  local db_cache_neg_ttl = kong_config.db_cache_neg_ttl
+  local page = 1
+  local cache_pages = 1
+
+  if kong_config.database == "off" then
+    db_cache_ttl = 0
+    db_cache_neg_ttl = 0
+    cache_pages = 2
+    page = ngx.shared.kong:get(kong_constants.DECLARATIVE_PAGE_KEY) or page
+  end
+
+  return kong_cache.new {
+    shm_name        = "kong_db_cache",
+    cluster_events  = cluster_events,
+    worker_events   = worker_events,
+    ttl             = db_cache_ttl,
+    neg_ttl         = db_cache_neg_ttl or db_cache_ttl,
+    resurrect_ttl   = kong_config.resurrect_ttl,
+    page            = page,
+    cache_pages     = cache_pages,
+    resty_lock_opts = LOCK_OPTS,
+  }
 end
 
 function _GLOBAL.init_core_cache(kong_config, cluster_events, worker_events)
-  error("in init_core_cache")
+  local db_cache_ttl = kong_config.db_cache_ttl
+  local db_cache_neg_ttl = kong_config.db_cache_neg_ttl
+  local page = 1
+  local cache_pages = 1
+  if kong_config.database == "off" then
+    db_cache_ttl = 0
+    db_cache_neg_ttl = 0
+    cache_pages = 2
+    page = ngx.shared.kong:get(kong_constants.DECLARATIVE_PAGE_KEY) or page
+  end
+
+  return kong_cache.new {
+    shm_name        = "kong_core_db_cache",
+    cluster_events  = cluster_events,
+    worker_events   = worker_events,
+    ttl             = db_cache_ttl,
+    neg_ttl         = db_cache_neg_ttl or db_cache_ttl,
+    resurrect_ttl   = kong_config.resurrect_ttl,
+    page            = page,
+    cache_pages     = cache_pages,
+    resty_lock_opts = LOCK_OPTS,
+  }
 end
 
 return _GLOBAL
