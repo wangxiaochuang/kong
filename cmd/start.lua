@@ -3,6 +3,7 @@ local conf_loader = require "kong.conf_loader"
 local kong_global = require "kong.global"
 local kill = require "kong.cmd.utils.kill"
 local log = require "kong.cmd.utils.log"
+local DB = require "kong.db"
 
 local function execute(args)
   args.db_timeout = args.db_timeout * 1000
