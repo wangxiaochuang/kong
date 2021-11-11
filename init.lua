@@ -369,6 +369,20 @@ function Kong.init_worker()
     return
   end
   kong.cache = cache
+
+  local core_cache, err = kong_global.init_core_cache(kong.configuration, cluster_events, worker_events)
+  if not core_cache then
+    stash_init_worker_error("failed to instantiate 'kong.core_cache' module: " ..
+                            err)
+    return
+  end
+  kong.core_cache = core_cache
+
+  ok, err = runloop.set_init_versions_in_cache()
+  if not ok then
+    stash_init_worker_error(err) -- 'err' fully formatted
+    return
+  end
 end
 
 function Kong.ssl_certificate()

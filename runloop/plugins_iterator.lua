@@ -1,0 +1,3 @@
+local PluginsIterator = {}
+
+return PluginsIterator

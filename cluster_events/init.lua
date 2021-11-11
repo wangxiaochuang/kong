@@ -128,19 +128,160 @@ function _M.new(opts)
 end
 
 function _M:broadcast(channel, data, delay)
-error("in broadcast")
+  if type(channel) ~= "string" then
+    return nil, "channel must be a string"
+  end
+
+  if type(data) ~= "string" then
+    return nil, "data must be a string"
+  end
+
+  if delay and type(delay) ~= "number" then
+    return nil, "delay must be a number"
+
+  elseif self.poll_delay > 0 then
+    delay = self.poll_delay
+  end
+
+  local ok, err = self.strategy:insert(self.node_id, channel, nil, data, delay)
+  if not ok then
+    return nil, err
+  end
+
+  return true
 end
 
 function _M:subscribe(channel, cb, start_polling)
-error("in subscribe")
+  if type(channel) ~= "string" then
+    return error("channel must be a string")
+  end
+
+  if type(cb) ~= "function" then
+    return error("callback must be a function")
+  end
+
+  if not self.callbacks[channel] then
+    self.callbacks[channel] = { cb }
+    insert(self.channels, channel)
+  else
+    insert(self.callbacks[channel], cb)
+  end
+
+  if start_polling == nil then
+    start_polling = true
+  end
+
+  if not self.polling and start_polling and self.use_polling then
+    -- start recurring polling timer
+
+    local ok, err = timer_at(self.poll_interval, poll_handler, self)
+    if not ok then
+      return nil, "failed to start polling timer: " .. err
+    end
+
+    self.polling = true
+  end
+
+  return true
 end
 
 local function process_event(self, row, local_start_time)
-error("in process_event")
+  if row.node_id == self.node_id then
+    return true
+  end
+
+  local ran, err = self.events_shm:get(row.id)
+  if err then
+    return nil, "failed to probe if event ran: " .. err
+  end
+
+  if ran then
+    return true
+  end
+
+  log(DEBUG, "new event (channel: '", row.channel, "') data: '", row.data,
+             "' nbf: '", row.nbf or "none", "' shm exptime: ",
+             self.event_ttl_shm)
+
+  -- mark as ran before running in case of long-running callbacks
+  local ok, err = self.events_shm:set(row.id, true, self.event_ttl_shm)
+  if not ok then
+    return nil, "failed to mark event as ran: " .. err
+  end
+
+  local cbs = self.callbacks[row.channel]
+  if not cbs then
+    return true
+  end
+
+  for j = 1, #cbs do
+    local delay
+
+    if row.nbf and row.now then
+      ngx_update_time()
+      local now = row.now + max(ngx_now() - local_start_time, 0)
+      delay = max(row.nbf - now, 0)
+    end
+
+    if delay and delay > 0 then
+      log(DEBUG, "delaying nbf event by ", delay, "s")
+
+      local ok, err = timer_at(delay, nbf_cb_handler, cbs[j], row.data)
+      if not ok then
+        log(ERR, "failed to schedule nbf event timer: ", err)
+      end
+
+    else
+      local ok, err = pcall(cbs[j], row.data)
+      if not ok and not ngx_debug then
+        log(ERR, "callback threw an error: ", err)
+      end
+    end
+  end
+
+  return true
 end
 
 local function poll(self)
-error("in poll")
+  local min_at, err = self.shm:get(CURRENT_AT_KEY)
+  if err then
+    return nil, "failed to retrieve 'at' in shm: " .. err
+  end
+
+  if min_at then
+    min_at = min_at - self.poll_offset - 0.001
+    log(DEBUG, "polling events from: ", min_at)
+  else
+    local now = self.strategy:server_time() or ngx_now()
+    min_at = now - self.event_ttl_shm
+    log(CRIT, "no 'at' in shm, polling events from: ", min_at)
+  end
+
+  for rows, err, page in self.strategy:select_interval(self.channels, min_at) do
+    if err then
+      return nil, "failed to retrieve events from DB: " .. err
+    end
+
+    local count = #rows
+
+    if page == 1 and rows[1].now then
+      local ok, err = self.shm:safe_set(CURRENT_AT_KEY, rows[1].now)
+      if not ok then
+        return nil, "failed to set 'at' in shm: " .. err
+      end
+    end
+
+    ngx_update_time()
+    local local_start_time = ngx_now()
+    for i = 1, count do
+      local ok, err = process_event(self, rows[i], local_start_time)
+      if not ok then
+        return nil, err
+      end
+    end
+  end
+
+  return true
 end
 
 if ngx_debug then
@@ -148,11 +289,61 @@ if ngx_debug then
 end
 
 local function get_lock(self)
-error("in get_lock")
+  local ok, err = self.shm:safe_add(POLL_RUNNING_LOCK_KEY, true,
+                                    max(self.poll_interval * 5, 10))
+  if not ok then
+    if err ~= "exists" then
+      log(ERR, "failed to acquire poll_running lock: ", err)
+    end
+
+    return false
+  end
+
+  if self.poll_interval > 0.001 then
+    ok, err = self.shm:safe_add(POLL_INTERVAL_LOCK_KEY, true,
+                                self.poll_interval - 0.001)
+    if not ok then
+      if err ~= "exists" then
+        log(ERR, "failed to acquire poll_interval lock: ", err)
+      end
+      self.shm:delete(POLL_RUNNING_LOCK_KEY)
+      return false
+    end
+  end
+
+  return true
 end
 
 poll_handler = function(premature, self)
-error("in poll_handler")
+  if premature or not self.polling then
+    -- set self.polling to false to stop a polling loop
+    return
+  end
+
+  if not get_lock(self) then
+    local ok, err = timer_at(self.poll_interval, poll_handler, self)
+    if not ok then
+      log(CRIT, "failed to start recurring polling timer: ", err)
+    end
+
+    return
+  end
+
+  local pok, perr, err = pcall(poll, self)
+  if not pok then
+    log(ERR, "poll() threw an error: ", perr)
+
+  elseif not perr then
+    log(ERR, "failed to poll: ", err)
+  end
+
+  -- unlock
+
+  self.shm:delete(POLL_RUNNING_LOCK_KEY)
+  local ok, err = timer_at(self.poll_interval, poll_handler, self)
+  if not ok then
+    log(CRIT, "failed to start recurring polling timer: ", err)
+  end
 end
 
 return _M
