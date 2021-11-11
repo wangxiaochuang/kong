@@ -133,10 +133,7 @@ local function load_plugin_handler(plugin)
   local plugin_handler = "kong.plugins." .. plugin .. ".handler"
   local ok, handler = utils.load_module_if_exists(plugin_handler)
   if not ok then
-    ok, handler = plugin_servers.load_plugin(plugin)
-    if type(handler) == "table" then
-      handler._go = true
-    end
+    error("extern plugin")
   end
 
   if not ok then

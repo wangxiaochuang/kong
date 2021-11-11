@@ -60,14 +60,23 @@ local function load_subsystems(db, plugin_names)
   local subsystems = require("kong.db.migrations.subsystems")
 
   local res = {}
-
+  -- core  *plugins
   for _, ss in ipairs(subsystems) do
     if ss.name:match("%*") then
       for _, plugin_name in ipairs(sorted_plugin_names) do
         local namespace = ss.namespace:gsub("%*", plugin_name)
         local ok, mig_idx = utils.load_module_if_exists(namespace)
         if ok then
-          error("in load_subsystems")
+          if type(mig_idx) ~= "table" then
+            return nil, fmt_err(db, "migrations index from '%s' must be a table",
+                                namespace)
+          end
+
+          table.insert(res, {
+            name = ss.name,
+            namespace = namespace,
+            migrations_index = mig_idx,
+          })
         end
       end
     else

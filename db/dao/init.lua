@@ -690,11 +690,7 @@ local function generate_foreign_key_methods(schema)
 
         local strategy = self.strategy
 
-        local rows, err_t, new_offset = strategy[page_method_name](strategy,
-                                                                   foreign_key,
-                                                                   size,
-                                                                   offset,
-                                                                   options)
+        local rows, err_t, new_offset = strategy[page_method_name](strategy, foreign_key, size, offset, options)
         if not rows then
           return nil, tostring(err_t), err_t
         end

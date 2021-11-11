@@ -272,7 +272,44 @@ do
   end
 
   local function get_service_for_route(db, route, services_init_cache)
-    error("in get_service_for_route")
+    local service_pk = route.service
+    if not service_pk then
+      return nil
+    end
+
+    local id = service_pk.id
+    local service = services_init_cache[id]
+    if service then
+      return service
+    end
+
+    local err
+
+    if kong.core_cache then
+      local cache_key = db.services:cache_key(service_pk.id, nil, nil, nil, nil,
+                                              route.ws_id)
+      service, err = kong.core_cache:get(cache_key, TTL_ZERO,
+                                    load_service_from_db, service_pk)
+    else
+      error("no core cache")
+    end
+
+    if err then
+      return nil, "error raised while finding service for route (" .. route.id .. "): " ..
+                  err
+
+    elseif not service then
+      return nil, "could not find service for route (" .. route.id .. ")"
+    end
+
+    if SUBSYSTEMS[service.protocol] ~= subsystem then
+      log(WARN, "service with protocol '", service.protocol,
+                "' cannot be used with '", subsystem, "' subsystem")
+
+      return nil
+    end
+
+    return service
   end
 
   local function get_router_version()
@@ -280,7 +317,61 @@ do
   end
 
   build_router = function(version)
-    error("in build_router")
+    local db = kong.db
+    local routes, i = {}, 0
+
+    local err
+
+    local services_init_cache = {}
+    if not kong.core_cache and db.strategy ~= "off" then
+      error("no off")
+    end
+
+    local counter = 0
+    local page_size = db.routes.pagination.max_page_size
+    for route, err in db.routes:each(page_size, GLOBAL_QUERY_OPTS) do
+      if err then
+        return nil, "could not load routes: " .. err
+      end
+
+      if db.strategy ~= "off" then
+        error("not off")
+      end
+
+      if should_process_route(route) then
+        local service, err = get_service_for_route(db, route, services_init_cache)
+        if err then
+          return nil, err
+        end
+
+        local r = {
+          route   = route,
+          service = service,
+        }
+
+        i = i + 1
+        routes[i] = r
+      end
+
+      counter = counter + 1
+    end
+
+    local new_router, err = Router.new(routes)
+    if not new_router then
+      return nil, "could not create router: " .. err
+    end
+
+    router = new_router
+
+    if version then
+      router_version = version
+    end
+
+    -- LEGACY - singletons module is deprecated
+    singletons.router = router
+    -- /LEGACY
+
+    return true
   end
 
   update_router = function()
@@ -352,6 +443,13 @@ return {
   _register_balancer_events = _register_balancer_events,
 
   init_worker = {
+    before = function()
+      if kong.configuration.host_ports then
+        HOST_PORTS = kong.configuration.host_ports
+      end
+        kong.v(HOST_PORTS)
+    end,
+    after = NOOP
   },
   certificate = {},
   preread = {},

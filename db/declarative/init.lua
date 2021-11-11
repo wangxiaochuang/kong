@@ -659,6 +659,7 @@ function declarative.load_into_cache(entities, meta, hash, shadow)
             _, unique_key = next(unique_key)
           end
 
+          -- 如果是跨ws，则不加ws_id
           local prefix = entity_name .. "|" .. ws_id
           if schema.fields[unique].unique_across_ws then
             prefix = entity_name .. "|"

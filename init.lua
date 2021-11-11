@@ -37,14 +37,14 @@ local DB = require "kong.db"
 local dns = require "kong.tools.dns"
 local meta = require "kong.meta"
 local lapis = require "lapis"
---local runloop = require "kong.runloop.handler"
+local runloop = require "kong.runloop.handler"
 --local stream_api = require "kong.tools.stream_api"
 local singletons = require "kong.singletons"
 local declarative = require "kong.db.declarative"
 local ngx_balancer = require "ngx.balancer"
 local kong_resty_ctx = require "kong.resty.ctx"
 local certificate = require "kong.runloop.certificate"
---local concurrency = require "kong.concurrency"
+local concurrency = require "kong.concurrency"
 --local cache_warmup = require "kong.cache.warmup"
 --local balancer_execute = require("kong.runloop.balancer").execute
 --local balancer_set_host_header = require("kong.runloop.balancer").set_host_header
@@ -248,7 +248,57 @@ local function parse_declarative_config(kong_config)
 end
 
 local function load_declarative_config(kong_config, entities, meta)
-  error("in load_declarative_config")
+  if kong_config.database ~= "off" then
+    return true
+  end
+
+  local opts = {
+    name = "declarative_config",
+  }
+
+  local kong_shm = ngx.shared.kong
+  local ok, err = concurrency.with_worker_mutex(opts, function()
+    local value = kong_shm:get(DECLARATIVE_LOAD_KEY)
+    if value then
+      return true
+    end
+
+    local ok, err = declarative.load_into_cache(entities, meta)
+    if not ok then
+      return nil, err
+    end
+
+    if kong_config.declarative_config then
+      kong.log.notice("declarative config loaded from ",
+                      kong_config.declarative_config)
+    end
+
+    ok, err = kong_shm:safe_set(DECLARATIVE_LOAD_KEY, true)
+    if not ok then
+      kong.log.warn("failed marking declarative_config as loaded: ", err)
+    end
+
+    return true
+  end)
+
+  if ok then
+    declarative.try_unlock()
+
+    local default_ws = kong.db.workspaces:select_by_name("default")
+    kong.default_workspace = default_ws and default_ws.id or kong.default_workspace
+
+    ok, err = runloop.build_plugins_iterator("init")
+    if not ok then
+      return nil, "error building initial plugins iterator: " .. err
+    end
+
+    ok, err = runloop.build_router("init")
+    if not ok then
+      return nil, "error building initial router: " .. err
+    end
+  end
+
+  return ok, err
 end
 
 local function list_migrations(migtable)
@@ -383,6 +433,32 @@ function Kong.init_worker()
     stash_init_worker_error(err) -- 'err' fully formatted
     return
   end
+
+  -- LEGACY
+  singletons.cache          = cache
+  singletons.core_cache     = core_cache
+  singletons.worker_events  = worker_events
+  singletons.cluster_events = cluster_events
+  -- /LEGACY
+
+  kong.db:set_events_handler(worker_events)
+
+  ok, err = load_declarative_config(kong.configuration,
+                                    declarative_entities,
+                                    declarative_meta)
+  if not ok then
+    stash_init_worker_error("failed to load declarative config file: " .. err)
+    return
+  end
+
+  if kong.configuration.role ~= "control_plane" then
+    ok, err = execute_cache_warmup(kong.configuration)
+    if not ok then
+      ngx_log(ngx_ERR, "failed to warm up the DB cache: " .. err)
+    end
+  end
+
+  runloop.init_worker.before()
 end
 
 function Kong.ssl_certificate()

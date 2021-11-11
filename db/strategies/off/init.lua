@@ -52,11 +52,98 @@ local function get_entity_ids_tagged(key, tag_names, tags_cond)
 end
 
 local function page_for_key(self, key, size, offset, options)
-  error("in page_for_key")
+  if not size then
+    size = self.connector:get_page_size(options)
+  end
+
+  if offset then
+    local token = decode_base64(offset)
+    if not token then
+      return nil, self.errors:invalid_offset(offset, "bad base64 encoding")
+    end
+
+    local number = tonumber(token)
+    if not number then
+      return nil, self.errors:invalid_offset(offset, "invalid offset")
+    end
+
+    offset = number
+
+  else
+    offset = 1
+  end
+
+  local cache = kong.core_cache
+  if not cache then
+    return {}
+  end
+
+  local list, err
+  if options and options.tags then
+    list, err = get_entity_ids_tagged(key, options.tags, options.tags_cond)
+  else
+    list, err = cache:get(key, nil, empty_list_cb)
+  end
+
+  if not list then
+    return nil, err
+  end
+
+  local ret = {}
+  local schema_name = self.schema.name
+
+  local item
+  for i = offset, offset + size - 1 do
+    item = list[i]
+    if not item then
+      offset = nil
+      break
+    end
+
+    if schema_name == "tags" then
+      local tag_name, entity_name, uuid = string.match(item, "^([^|]+)|([^|]+)|(.+)$")
+      if not tag_name then
+        return nil, "Could not parse tag from cache: " .. tostring (item)
+      end
+    else
+      item = cache:get(item, nil, nil_cb)
+    end
+
+    if not item then
+      return nil, "stale data detected while paginating"
+    end
+
+    item = self.schema:process_auto_fields(item, "select", true, {
+      no_defaults = true,
+      show_ws_id = true,
+    })
+
+    ret[i - offset + 1] = item
+  end
+
+  if offset then
+    return ret, nil, encode_base64(tostring(offset + size), true)
+  end
+
+  return ret
 end
 
 local function select_by_key(self, key)
-  error("in select_by_key")
+  if not kong.core_cache then
+    return nil
+  end
+
+  local entity, err = kong.core_cache:get(key, nil, nil_cb)
+  if not entity then
+    return nil, err
+  end
+
+  entity = self.schema:process_auto_fields(entity, "select", true, {
+    no_defaults = true,
+    show_ws_id = true,
+  })
+
+  return entity
 end
 
 local function page(self, size, offset, options)
@@ -73,7 +160,23 @@ local function select(self, pk, options)
 end
 
 local function select_by_field(self, field, value, options)
-  error("in select_by_field")
+  if type(value) == "table" then
+    local _
+    _, value = next(value)
+  end
+
+  local ws_id = ws(self, options)
+  
+  if field ~= "cache_key" then
+    local unique_across_ws = self.schema.fields[field].unique_across_ws
+    if unique_across_ws then
+      ws_id = ""
+    end
+    assert(not options or options.workspace ~= null or unique_across_ws)
+  end
+
+  local key = self.schema.name .. "|" .. ws_id .. "|" .. field .. ":" .. value
+  return select_by_key(self, key)
 end
 
 do

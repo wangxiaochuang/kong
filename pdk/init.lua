@@ -100,6 +100,8 @@ function _PDK.new(kong_config, major_version, self)
         if t.ctx.core and t.ctx.core.log then
           return t.ctx.core.log
         end
+
+        return (rawget(t, "_log"))
       end
 
       if k == "v" then

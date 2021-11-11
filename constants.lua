@@ -3,7 +3,7 @@ local plugins = {
   --"acl",
   --"correlation-id",
   "cors",
-  --"oauth2",
+  "oauth2",
   --"tcp-log",
   --"udp-log",
   --"file-log",

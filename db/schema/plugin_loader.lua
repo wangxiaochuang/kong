@@ -195,8 +195,7 @@ function plugin_loader.load_subschema(parent_schema, plugin, errors)
   local is_legacy = false
   -- 都是有name的
   if not schema.name then
-    is_legacy = true
-    schema, err = convert_legacy_schema(plugin, schema)
+    error("no schema name")
   end
 
   if not err then
