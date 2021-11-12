@@ -7,6 +7,9 @@ local function serialise_obj(data)
    or type(data) == "table" then
     return tostring(data)
   end
+  if type(data) == "number" and data > 1e308 then
+    data = tostring(data)
+  end
 
   return data
 end
@@ -121,7 +124,8 @@ end
 
 _M.v = function(data)
   clear_tab(cached_tab)
-  _M.log(_LEVELS.error, "%s", json_encode(tab_clone_with_serialise(data)))
+  data = json_encode(tab_clone_with_serialise(data))
+  _M.log(_LEVELS.error, "%s", data)
 end
 
 return setmetatable(_M, {
